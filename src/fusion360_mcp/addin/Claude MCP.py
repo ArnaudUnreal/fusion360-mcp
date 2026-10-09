@@ -312,6 +312,42 @@ def _rollback_to(mark: int) -> int:
     return removed
 
 
+def _mark(tl) -> dict:
+    """What the timeline holds before a call: its entries and where the marker is.
+
+    A count alone is not enough to undo a call. When the marker sits
+    mid-history, Fusion inserts new features at the marker, not at the end,
+    so "everything after the old count" would be the tail of the existing
+    history -- deleting it removed features the call never touched.
+    """
+    return {'count': tl.count, 'marker': tl.markerPosition,
+            'entities': [tl.item(i).entity for i in range(tl.count)]}
+
+
+def _rollback_new(mark: dict) -> int:
+    """Delete the timeline entries that were not there at `mark`, wherever
+    they were inserted, and put the marker back where it was. Returns how
+    many went.
+
+    Entities are compared with ==, never by entityToken (not guaranteed
+    stable) or by name (the call may have renamed things).
+    """
+    tl = _timeline()
+    if tl is None:
+        return 0
+    before = mark['entities']
+    removed = 0
+    for i in range(tl.count - 1, -1, -1):
+        entry = tl.item(i)
+        ent = entry.entity
+        if ent is None or any(ent == b for b in before):
+            continue
+        if _delete_entry(entry):
+            removed += 1
+    tl.markerPosition = min(mark['marker'], tl.count)
+    return removed
+
+
 def _undo() -> str:
     """Undo the last state-changing fusion_eval call. The Ctrl+Z of the bridge."""
     global _checkpoint  # noqa: PLW0603
@@ -322,9 +358,9 @@ def _undo() -> str:
         return 'no parametric timeline: direct-modelling designs cannot roll back'
     target = _checkpoint
     _checkpoint = None  # ponytail: single level, matching one saved checkpoint
-    removed = _rollback_to(target)
+    removed = _rollback_new(target)
     return 'undone: %d timeline entr%s removed, back to position %d' % (
-        removed, 'y' if removed == 1 else 'ies', target)
+        removed, 'y' if removed == 1 else 'ies', target['count'])
 
 
 def _delta(mark, tl, bodies_before, root) -> str:
@@ -359,14 +395,14 @@ def _run_code(code: str) -> dict:
     if scope['design']:
         scope['root'] = scope['design'].rootComponent
 
-    # Checkpoint on count, not markerPosition: the marker can sit behind the
-    # end (user rolled back in the UI), and comparing against it would either
-    # miss new features or delete ones that were already there.
+    # Checkpoint on the entries themselves, not on a position: the marker can
+    # sit behind the end (user rolled back in the UI, or the call moved it),
+    # and new features then land mid-history, not after the old count.
     tl = _timeline()
     # `if tl is None`, never `if tl`: Timeline implements __len__, so an empty
     # one is falsy and `tl.count if tl else None` silently disabled rollback
     # and undo() in every fresh document -- the exact case a first model hits.
-    mark = tl.count if tl is not None else None
+    mark = _mark(tl) if tl is not None else None
     bodies_before = scope['root'].bRepBodies.count if scope['root'] else 0
 
     try:
@@ -376,15 +412,15 @@ def _run_code(code: str) -> dict:
         # halfway through never leaves half-built geometry behind.
         undone = 0
         rollback_err = ''
-        if mark is not None and tl.count > mark:
+        if mark is not None and tl.count > mark['count']:
             try:
-                undone = _rollback_to(mark)
+                undone = _rollback_new(mark)
             except Exception:  # noqa: BLE001 - rollback is best-effort
                 _trace('rollback failed: ' + traceback.format_exc())
                 rollback_err = traceback.format_exc().strip().splitlines()[-1]
             # Report a silent no-op too: geometry surviving the error is
             # something the caller must know before trying again.
-            if tl.count > mark and not rollback_err:
+            if tl.count > mark['count'] and not rollback_err:
                 rollback_err = 'no entry could be deleted'
         _checkpoint = None
         err = traceback.format_exc()
@@ -401,7 +437,7 @@ def _run_code(code: str) -> dict:
 
     # Only remember a checkpoint when the call actually built something;
     # undo() after a read-only call would otherwise clobber earlier work.
-    if mark is not None and tl.count > mark:
+    if mark is not None and tl.count > mark['count']:
         _checkpoint = mark
 
     value = scope.get('result')
@@ -413,7 +449,8 @@ def _run_code(code: str) -> dict:
     # Report what the call did to the model. A build that returns nothing
     # otherwise comes back as null, and the caller spends a snapshot() just
     # to find out whether it worked.
-    changed = _delta(mark, tl, bodies_before, scope['root'])
+    changed = _delta(mark['count'] if mark is not None else None, tl,
+                     bodies_before, scope['root'])
     if changed:
         return {'ok': True, 'result': value, 'changed': changed}
     return {'ok': True, 'result': value}
