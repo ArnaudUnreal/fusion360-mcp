@@ -363,6 +363,19 @@ def _undo() -> str:
         removed, 'y' if removed == 1 else 'ies', target['count'])
 
 
+def _alive(obj) -> bool:
+    """False once the object's document is gone (the call closed it).
+
+    Ask the Design, not the Timeline: on a closed document Design.isValid and
+    rootComponent.isValid turn False, but Timeline.isValid stays True while
+    timeline.count raises "4 : An API Object refers to a deleted Object".
+    """
+    try:
+        return obj is not None and obj.isValid
+    except Exception:  # noqa: BLE001 - a dead wrapper can raise on any access
+        return False
+
+
 def _delta(mark, tl, bodies_before, root) -> str:
     """One line on what the call changed in the model, or '' if nothing did."""
     bits = []
@@ -394,6 +407,7 @@ def _run_code(code: str) -> dict:
     }
     if scope['design']:
         scope['root'] = scope['design'].rootComponent
+    design0 = scope['design']  # the user code may rebind `design`
 
     # Checkpoint on the entries themselves, not on a position: the marker can
     # sit behind the end (user rolled back in the UI, or the call moved it),
@@ -412,7 +426,7 @@ def _run_code(code: str) -> dict:
         # halfway through never leaves half-built geometry behind.
         undone = 0
         rollback_err = ''
-        if mark is not None and tl.count > mark['count']:
+        if mark is not None and _alive(design0) and tl.count > mark['count']:
             try:
                 undone = _rollback_new(mark)
             except Exception:  # noqa: BLE001 - rollback is best-effort
@@ -420,7 +434,7 @@ def _run_code(code: str) -> dict:
                 rollback_err = traceback.format_exc().strip().splitlines()[-1]
             # Report a silent no-op too: geometry surviving the error is
             # something the caller must know before trying again.
-            if tl.count > mark['count'] and not rollback_err:
+            if _alive(design0) and tl.count > mark['count'] and not rollback_err:
                 rollback_err = 'no entry could be deleted'
         _checkpoint = None
         err = traceback.format_exc()
@@ -434,6 +448,15 @@ def _run_code(code: str) -> dict:
                     'call is still in the model. Clean it up before retrying.'
                     % rollback_err)
         return {'ok': False, 'error': err}
+
+    # The call may have closed or switched the document it started in: its
+    # timeline and root are dead wrappers now, and reading them raised after
+    # the code had already succeeded. Nothing to checkpoint or report then,
+    # and an older checkpoint would point undo() at the wrong document.
+    if not _alive(design0):
+        tl, mark = None, None
+        _checkpoint = None
+        scope['root'] = None
 
     # Only remember a checkpoint when the call actually built something;
     # undo() after a read-only call would otherwise clobber earlier work.
